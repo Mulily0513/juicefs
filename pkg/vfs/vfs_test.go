@@ -17,11 +17,13 @@
 package vfs
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -60,6 +62,13 @@ func createTestVFS(applyMetaConfOption func(metaConfig *meta.Config), metaUri st
 		Compression: "lz4",
 		DirStats:    true,
 	}
+	storageName, storageEndpoint := "mem", ""
+	if os.Getenv("OMNISTORE_JUICEFS_VFS_TEST") == "1" {
+		storageName = "omnistore"
+		storageEndpoint = os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+		format.Storage = storageName
+		format.Compression = "none"
+	}
 	err := m.Init(format, true)
 	if err != nil {
 		log.Fatalf("setting: %s", err)
@@ -79,12 +88,69 @@ func createTestVFS(applyMetaConfOption func(metaConfig *meta.Config), metaUri st
 		},
 		FuseOpts: &FuseOptions{},
 	}
-	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	rawBlob, err := object.CreateStorage(storageName, storageEndpoint, "", "", "")
+	if err != nil {
+		log.Fatalf("create object storage: %s", err)
+	}
+	blob := rawBlob
+	if storageName == "omnistore" {
+		blob = object.WithPrefix(rawBlob, fmt.Sprintf("juicefs-live-vfs-%d/", time.Now().UnixNano()))
+	}
 	registry := prometheus.NewRegistry() // replace default so only JuiceFS metrics are exposed
 	registerer := prometheus.WrapRegistererWithPrefix("juicefs_",
 		prometheus.WrapRegistererWith(prometheus.Labels{"mp": mp, "vol_name": format.Name}, registry))
 	store := chunk.NewCachedStore(blob, *conf.Chunk, registry)
 	return NewVFS(conf, m, store, registerer, registry), blob
+}
+
+func TestOmniStoreVFSIOAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+	t.Setenv("OMNISTORE_JUICEFS_VFS_TEST", "1")
+
+	v, blob := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	fe, fh, eno := v.Create(ctx, 1, "omnistore-file", 0644, 0, syscall.O_RDWR)
+	if eno != 0 {
+		t.Fatalf("create file: %s", eno)
+	}
+
+	payload := make([]byte, 4<<20+32)
+	for i := range payload {
+		payload[i] = byte((i * 43) % 251)
+	}
+	if eno := v.Write(ctx, fe.Inode, payload, 0, fh); eno != 0 {
+		t.Fatalf("write file: %s", eno)
+	}
+	if eno := v.Fsync(ctx, fe.Inode, 1, fh); eno != 0 {
+		t.Fatalf("fsync file: %s", eno)
+	}
+
+	tail := make([]byte, 48)
+	if n, eno := v.Read(ctx, fe.Inode, tail, 4<<20-16, fh); eno != 0 || n != len(tail) {
+		t.Fatalf("range read across OmniStore chunks: n=%d err=%s", n, eno)
+	}
+	if !bytes.Equal(tail, payload[4<<20-16:4<<20-16+len(tail)]) {
+		t.Fatal("VFS range read does not match data written to OmniStore")
+	}
+
+	var attr meta.Attr
+	if eno := v.Truncate(ctx, fe.Inode, 1234, fh, &attr); eno != 0 {
+		t.Fatalf("truncate file: %s", eno)
+	}
+	if eno := v.Fsync(ctx, fe.Inode, 1, fh); eno != 0 {
+		t.Fatalf("fsync after truncate: %s", eno)
+	}
+	if attr.Length != 1234 {
+		t.Fatalf("length after truncate: got %d, want 1234", attr.Length)
+	}
+	v.Release(ctx, fe.Inode, fh)
+	if eno := v.Unlink(ctx, 1, "omnistore-file"); eno != 0 {
+		t.Fatalf("unlink file: %s", eno)
+	}
+	object.Shutdown(blob)
 }
 
 func TestVFSBasic(t *testing.T) {

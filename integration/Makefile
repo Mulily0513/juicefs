@@ -2,7 +2,7 @@
 all: s3test webdav ioctl
 
 s3test:
-	pip install awscli==1.27.153
+	@if ! command -v aws >/dev/null 2>&1; then pip install awscli==1.27.153; fi
 	bash s3gateway_test.sh
 
 webdav:

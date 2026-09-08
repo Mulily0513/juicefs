@@ -17,6 +17,8 @@
 package fs
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -273,6 +275,106 @@ func TestFileSystem(t *testing.T) {
 	}
 }
 
+// TestOmniStoreFileSystemAgainstCluster exercises the filesystem data path
+// with the real OmniStore object backend. The metadata tree remains in-memory
+// so this test isolates JuiceFS file operations from metadata engines.
+func TestOmniStoreFileSystemAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+
+	m := meta.NewClient("memkv://", nil)
+	format := &meta.Format{
+		Name:        "omnistore-fs-test",
+		BlockSize:   4096,
+		Capacity:    1 << 30,
+		Compression: "none",
+		DirStats:    true,
+	}
+	if err := m.Init(format, true); err != nil {
+		t.Fatalf("init metadata: %s", err)
+	}
+
+	conf := vfs.Config{
+		Meta: meta.DefaultConf(),
+		Chunk: &chunk.Config{
+			BlockSize:   format.BlockSize << 10,
+			Compress:    "none",
+			CacheDir:    "memory",
+			CacheSize:   16 << 20,
+			MaxUpload:   2,
+			MaxDownload: 200,
+			BufferSize:  16 << 20,
+			PutTimeout:  10 * time.Second,
+			GetTimeout:  10 * time.Second,
+		},
+		DirEntryTimeout: time.Millisecond * 100,
+		EntryTimeout:    time.Millisecond * 100,
+		AttrTimeout:     time.Millisecond * 100,
+	}
+	rawObjStore, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatalf("create OmniStore backend: %s", err)
+	}
+	objStore := object.WithPrefix(rawObjStore, fmt.Sprintf("juicefs-live-fs-%d/", time.Now().UnixNano()))
+	store := chunk.NewCachedStore(objStore, *conf.Chunk, nil)
+	jfs, err := NewFileSystem(&conf, m, store, nil)
+	if err != nil {
+		object.Shutdown(rawObjStore)
+		t.Fatalf("initialize filesystem: %s", err)
+	}
+	defer func() {
+		_ = jfs.Close()
+		object.Shutdown(rawObjStore)
+	}()
+
+	ctx := meta.NewContext(1, 1, []uint32{2})
+	f, eno := jfs.Create(ctx, "/omnistore-e2e", 0666, 022)
+	if eno != 0 {
+		t.Fatalf("create file: %s", eno)
+	}
+
+	const tailOffset = 4<<20 - 16
+	payload := make([]byte, 4<<20+32)
+	for i := range payload {
+		payload[i] = byte((i * 31) % 251)
+	}
+	if n, eno := f.Pwrite(ctx, payload, 0); eno != 0 || n != len(payload) {
+		t.Fatalf("write across OmniStore chunks: n=%d err=%s", n, eno)
+	}
+	if eno := f.Fsync(ctx); eno != 0 {
+		t.Fatalf("fsync: %s", eno)
+	}
+	if info, err := f.Stat(); err != nil || info.Size() != int64(len(payload)) {
+		t.Fatalf("stat after write: size=%d err=%v", info.Size(), err)
+	}
+
+	tail := make([]byte, 48)
+	if n, err := f.Pread(ctx, tail, tailOffset); err != nil || n != len(tail) {
+		t.Fatalf("range read across chunk boundary: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(tail, payload[tailOffset:tailOffset+int64(len(tail))]) {
+		t.Fatal("range read does not match data written to OmniStore")
+	}
+
+	if eno := f.Truncate(ctx, 1234); eno != 0 {
+		t.Fatalf("truncate: %s", eno)
+	}
+	if eno := f.Fsync(ctx); eno != 0 {
+		t.Fatalf("fsync after truncate: %s", eno)
+	}
+	if info, err := f.Stat(); err != nil || info.Size() != 1234 {
+		t.Fatalf("stat after truncate: size=%d err=%v", info.Size(), err)
+	}
+	if eno := f.Close(ctx); eno != 0 {
+		t.Fatalf("close: %s", eno)
+	}
+	if eno := jfs.Unlink(ctx, "/omnistore-e2e"); eno != 0 {
+		t.Fatalf("unlink: %s", eno)
+	}
+}
+
 func TestBatchDeleteEntries(t *testing.T) {
 	jfs := createTestFS(t)
 	ctx := meta.NewContext(1, 1, []uint32{2})
@@ -401,14 +503,32 @@ func createTestFS(t testing.TB) *FileSystem {
 		AttrTimeout:     time.Millisecond * 100,
 		AccessLog:       filepath.Join(t.TempDir(), "juicefs.access.log"),
 	}
-	objStore, _ := object.CreateStorage("mem", "", "", "", "")
+	storageName, storageEndpoint := "mem", ""
+	if os.Getenv("OMNISTORE_JUICEFS_FS_TEST") == "1" {
+		storageName = "omnistore"
+		storageEndpoint = os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+		format.Storage = storageName
+		format.Compression = "none"
+	}
+	rawObjStore, err := object.CreateStorage(storageName, storageEndpoint, "", "", "")
+	if err != nil {
+		t.Fatalf("create object storage: %s", err)
+	}
+	objStore := rawObjStore
+	if storageName == "omnistore" {
+		objStore = object.WithPrefix(rawObjStore, fmt.Sprintf("juicefs-live-fs-all-%d/", time.Now().UnixNano()))
+	}
 	store := chunk.NewCachedStore(objStore, *conf.Chunk, nil)
 	jfs, err := NewFileSystem(&conf, m, store, nil)
 	if err != nil {
+		object.Shutdown(rawObjStore)
 		t.Fatalf("initialize  failed: %s", err)
 	}
 	jfs.checkAccessFile = time.Millisecond
 	jfs.rotateAccessLog = 500
-	t.Cleanup(func() { _ = jfs.Close() })
+	t.Cleanup(func() {
+		_ = jfs.Close()
+		object.Shutdown(rawObjStore)
+	})
 	return jfs
 }

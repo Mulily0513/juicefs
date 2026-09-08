@@ -140,7 +140,9 @@ func mountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraMoun
 	if bucket != nil {
 		*bucket = testDir
 	}
-	formatArgs := []string{"", "format", "--bucket", testDir, testMeta, testVolume}
+	formatArgs := []string{"", "format"}
+	formatArgs = append(formatArgs, integrationStorageFlags(testDir)...)
+	formatArgs = append(formatArgs, testMeta, testVolume)
 	if extraFormatOpts != nil {
 		formatArgs = append(formatArgs, extraFormatOpts...)
 	}
@@ -281,7 +283,9 @@ func tryMountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraM
 	if bucket != nil {
 		*bucket = testDir
 	}
-	formatArgs := []string{"", "format", "--bucket", testDir, testMeta, testVolume}
+	formatArgs := []string{"", "format"}
+	formatArgs = append(formatArgs, integrationStorageFlags(testDir)...)
+	formatArgs = append(formatArgs, testMeta, testVolume)
 	if extraFormatOpts != nil {
 		formatArgs = append(formatArgs, extraFormatOpts...)
 	}

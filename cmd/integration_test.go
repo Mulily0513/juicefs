@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,12 +34,33 @@ const webdavMeta = "redis://127.0.0.1:6379/15"
 const webdavVolume = "webdav-volume"
 const webdavAddr = "localhost:9009"
 
+// integrationStorageBucket allows the integration fixture to exercise a real
+// object backend without changing the default local-file test behavior. It is
+// intentionally test-only: production commands still receive their storage
+// configuration from the volume format.
+func integrationStorageBucket(fallback string) string {
+	if endpoint := os.Getenv("OMNISTORE_JUICEFS_CMD_ENDPOINT"); endpoint != "" {
+		return endpoint
+	}
+	return fallback
+}
+
+func integrationStorageFlags(fallback string) []string {
+	if os.Getenv("OMNISTORE_JUICEFS_CMD_ENDPOINT") != "" {
+		return []string{"--storage", "omnistore", "--bucket", integrationStorageBucket(fallback)}
+	}
+	return []string{"--bucket", fallback}
+}
+
 func startGateway(t *testing.T) {
 	opt, _ := redis.ParseURL(gatewayMeta)
 	rdb := redis.NewClient(opt)
 	_ = rdb.FlushDB(context.Background())
 	testDir := t.TempDir()
-	if err := Main([]string{"", "format", "--bucket", testDir, gatewayMeta, gatewayVolume}); err != nil {
+	formatArgs := []string{"", "format"}
+	formatArgs = append(formatArgs, integrationStorageFlags(testDir)...)
+	formatArgs = append(formatArgs, gatewayMeta, gatewayVolume)
+	if err := Main(formatArgs); err != nil {
 		t.Fatalf("format failed: %s", err)
 	}
 
@@ -58,7 +80,10 @@ func startWebdav(t *testing.T) {
 	rdb := redis.NewClient(opt)
 	_ = rdb.FlushDB(context.Background())
 	testDir := t.TempDir()
-	if err := Main([]string{"", "format", "--bucket", testDir, webdavMeta, webdavVolume}); err != nil {
+	formatArgs := []string{"", "format"}
+	formatArgs = append(formatArgs, integrationStorageFlags(testDir)...)
+	formatArgs = append(formatArgs, webdavMeta, webdavVolume)
+	if err := Main(formatArgs); err != nil {
 		t.Fatalf("format failed: %s", err)
 	}
 
@@ -81,7 +106,8 @@ func TestIntegration(t *testing.T) {
 	startGateway(t)
 	startWebdav(t)
 	_ = os.Chdir("../integration")
-	makeCmd := exec.Command("make")
+	makeArgs := strings.Fields(os.Getenv("OMNISTORE_JUICEFS_INTEGRATION_TARGETS"))
+	makeCmd := exec.Command("make", makeArgs...)
 	makeCmd.Env = append(os.Environ(), "MOUNT_POINT="+testMountPoint)
 	out, err := makeCmd.CombinedOutput()
 	if err != nil {

@@ -18,7 +18,10 @@ package vfs
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -35,12 +38,35 @@ func TestCompact(t *testing.T) {
 		CacheSize:   10 << 20,
 		CacheDir:    "memory",
 	}
-	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	storageName, storageEndpoint := "mem", ""
+	live := os.Getenv("OMNISTORE_JUICEFS_COMPACT_TEST") == "1"
+	if live {
+		storageName = "omnistore"
+		storageEndpoint = os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	}
+	rawBlob, err := object.CreateStorage(storageName, storageEndpoint, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := rawBlob
+	if live {
+		blob = object.WithPrefix(rawBlob, fmt.Sprintf("juicefs-live-compact-%d/", time.Now().UnixNano()))
+	}
 	store := chunk.NewCachedStore(blob, cconf, nil)
 
 	// prepare the slices
 	var slices []meta.Slice
 	var total int
+	var cid uint64 = 1000
+	if live {
+		defer func() {
+			for _, slice := range slices {
+				_ = store.Remove(slice.Id, int(slice.Len))
+			}
+			_ = store.Remove(cid, total)
+			object.Shutdown(blob)
+		}()
+	}
 	for i := 0; i < 100; i++ {
 		buf := make([]byte, 100+i*100)
 		for j := range buf {
@@ -60,8 +86,7 @@ func TestCompact(t *testing.T) {
 	}
 
 	// compact
-	var cid uint64 = 1000
-	err := Compact(cconf, store, slices, cid, 0)
+	err = Compact(cconf, store, slices, cid, 0)
 	if err != nil {
 		t.Fatalf("compact %d slices : %s", len(slices), err)
 	}

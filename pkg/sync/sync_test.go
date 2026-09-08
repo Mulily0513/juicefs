@@ -17,6 +17,7 @@ package sync
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
@@ -95,6 +96,129 @@ func TestIeratorSingleEmptyKey(t *testing.T) {
 func deepEqualWithOutMtime(a, b object.Object) bool {
 	return a.IsDir() == b.IsDir() && a.Key() == b.Key() && a.Size() == b.Size() &&
 		math.Abs(a.Mtime().Sub(b.Mtime()).Seconds()) < 1
+}
+
+type failOncePutStorage struct {
+	object.ObjectStorage
+	key       string
+	remaining int
+	seen      []string
+}
+
+func (s *failOncePutStorage) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	s.seen = append(s.seen, key)
+	if key == s.key && s.remaining > 0 {
+		s.remaining--
+		return fmt.Errorf("injected Put failure for %q", key)
+	}
+	return s.ObjectStorage.Put(ctx, key, in, getters...)
+}
+
+func omniStoreTestEndpoint(endpoint, prefix string) string {
+	parts := strings.SplitN(endpoint, "?", 2)
+	base := strings.TrimSuffix(parts[0], "/") + "/" + prefix
+	if len(parts) == 1 {
+		return base
+	}
+	return base + "?" + parts[1]
+}
+
+func readSyncObject(t *testing.T, store object.ObjectStorage, key string) []byte {
+	t.Helper()
+	r, err := store.Get(ctx, key, 0, -1)
+	if err != nil {
+		t.Fatalf("get %q: %v", key, err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read %q: %v", key, err)
+	}
+	return data
+}
+
+// TestOmniStoreCheckpointAgainstCluster verifies that a failed sync persists
+// its checkpoint in the real OmniStore backend and that a later run resumes
+// from it and removes the checkpoint after completing successfully.
+func TestOmniStoreCheckpointAgainstCluster(t *testing.T) {
+	baseEndpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if baseEndpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+
+	srcDir := t.TempDir() + "/"
+	contents := map[string][]byte{
+		"a": []byte("checkpoint-a"),
+		"b": []byte("checkpoint-b"),
+		"c": []byte("checkpoint-c"),
+	}
+	for name, data := range contents {
+		if err := os.WriteFile(srcDir+name, data, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	prefix := fmt.Sprintf("juicefs-checkpoint-%d", time.Now().UnixNano())
+	endpoint := omniStoreTestEndpoint(baseEndpoint, prefix)
+	baseDst, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Shutdown(baseDst)
+
+	config := func() *Config {
+		return &Config{
+			Threads:            1,
+			ListThreads:        1,
+			Update:             true,
+			Limit:              -1,
+			MaxSize:            math.MaxInt64,
+			Quiet:              true,
+			EnableCheckpoint:   true,
+			CheckpointInterval: time.Hour,
+		}
+	}
+
+	failingDst := &failOncePutStorage{ObjectStorage: baseDst, key: "b", remaining: 3}
+	if err := Sync(mustCreateFileStorage(t, srcDir), failingDst, config()); err == nil {
+		t.Fatalf("expected the injected object failure to fail the first sync; puts=%v", failingDst.seen)
+	}
+
+	checkpointKey := generateCheckpointKey("file://"+srcDir, endpoint, config())
+	if _, err := baseDst.Head(ctx, checkpointKey); err != nil {
+		t.Fatalf("checkpoint was not persisted in OmniStore: %v", err)
+	}
+
+	dst2, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Shutdown(dst2)
+	if err := Sync(mustCreateFileStorage(t, srcDir), dst2, config()); err != nil {
+		t.Fatalf("resume sync: %v", err)
+	}
+
+	for name, want := range contents {
+		if got := readSyncObject(t, dst2, name); !bytes.Equal(got, want) {
+			t.Fatalf("resumed object %q: got %q, want %q", name, got, want)
+		}
+	}
+	if _, err := dst2.Head(ctx, checkpointKey); !os.IsNotExist(err) {
+		t.Fatalf("checkpoint after successful resume: got %v, want not-exist", err)
+	}
+
+	for name := range contents {
+		_ = dst2.Delete(ctx, name)
+	}
+}
+
+func mustCreateFileStorage(t *testing.T, root string) object.ObjectStorage {
+	t.Helper()
+	store, err := object.CreateStorage("file", root, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
 }
 
 // nolint:errcheck

@@ -133,6 +133,407 @@ func TestStoreDefault(t *testing.T) {
 	}
 }
 
+func TestOmniStoreCachedStoreAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+	blob, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Shutdown(blob)
+
+	conf := defaultConf
+	conf.CacheDir = "memory"
+	conf.Compress = "none"
+	conf.BlockSize = 1 << 20
+	conf.Writeback = false
+	// A real three-replica backend can take longer than the short in-memory
+	// test defaults while a PG leader is being selected or a delete is being
+	// replicated. Keep this live contract test strict enough to catch a hang,
+	// but avoid treating normal Docker scheduling jitter as a backend failure.
+	conf.PutTimeout = 10 * time.Second
+	conf.GetTimeout = 10 * time.Second
+	store := NewCachedStore(blob, conf, nil)
+
+	id := uint64(time.Now().UnixNano())
+	length := conf.BlockSize*2 + 123
+	payload := make([]byte, length)
+	for i := range payload {
+		payload[i] = byte((i * 17) % 251)
+	}
+
+	writer := store.NewWriter(id, 0)
+	if n, err := writer.WriteAt(payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("chunk write: n=%d err=%v", n, err)
+	}
+	if err := writer.Finish(length); err != nil {
+		t.Fatalf("chunk finish: %v", err)
+	}
+	defer func() {
+		if err := store.Remove(id, length); err != nil {
+			t.Errorf("chunk remove: %v", err)
+		}
+	}()
+
+	reader := store.NewReader(id, length)
+	page := NewPage(make([]byte, length))
+	defer page.Release()
+	if n, err := reader.ReadAt(context.Background(), page, 0); err != nil || n != length {
+		t.Fatalf("chunk full read: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(page.Data, payload) {
+		t.Fatal("chunk full read does not match written data")
+	}
+
+	const rangeOffset = 1<<20 - 13
+	rangePage := NewPage(make([]byte, 32))
+	defer rangePage.Release()
+	if n, err := reader.ReadAt(context.Background(), rangePage, rangeOffset); err != nil || n != len(rangePage.Data) {
+		t.Fatalf("chunk cross-block read: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(rangePage.Data, payload[rangeOffset:rangeOffset+len(rangePage.Data)]) {
+		t.Fatal("chunk cross-block read does not match written data")
+	}
+}
+
+func TestOmniStoreCachedStoreBoundariesAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+	blob, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Shutdown(blob)
+
+	conf := defaultConf
+	conf.CacheDir = "memory"
+	conf.Compress = "none"
+	conf.BlockSize = 1 << 20
+	conf.Writeback = false
+	conf.PutTimeout = 10 * time.Second
+	conf.GetTimeout = 10 * time.Second
+	store := NewCachedStore(blob, conf, nil)
+
+	for i, length := range []int{4 << 10, conf.BlockSize, 4 << 20, 4<<20 + 1} {
+		id := uint64(time.Now().UnixNano()) + uint64(i)
+		payload := make([]byte, length)
+		for j := range payload {
+			payload[j] = byte((j*31 + i) % 251)
+		}
+		writer := store.NewWriter(id, 0)
+		if n, err := writer.WriteAt(payload, 0); err != nil || n != len(payload) {
+			t.Fatalf("boundary %d write: n=%d err=%v", length, n, err)
+		}
+		if err := writer.Finish(length); err != nil {
+			t.Fatalf("boundary %d finish: %v", length, err)
+		}
+		defer func(id uint64, length int) {
+			if err := store.Remove(id, length); err != nil {
+				t.Errorf("boundary %d remove: %v", length, err)
+			}
+		}(id, length)
+
+		reader := store.NewReader(id, length)
+		page := NewPage(make([]byte, length))
+		if n, err := reader.ReadAt(context.Background(), page, 0); err != nil || n != length {
+			page.Release()
+			t.Fatalf("boundary %d full read: n=%d err=%v", length, n, err)
+		}
+		if !bytes.Equal(page.Data, payload) {
+			page.Release()
+			t.Fatalf("boundary %d full read does not match written data", length)
+		}
+		page.Release()
+
+		const rangeLength = 32
+		rangeOffset := length - rangeLength
+		if rangeOffset < 0 {
+			rangeOffset = 0
+		}
+		rangePage := NewPage(make([]byte, rangeLength))
+		if n, err := reader.ReadAt(context.Background(), rangePage, rangeOffset); err != nil || n != rangeLength {
+			rangePage.Release()
+			t.Fatalf("boundary %d tail read: n=%d err=%v", length, n, err)
+		}
+		if !bytes.Equal(rangePage.Data, payload[rangeOffset:rangeOffset+rangeLength]) {
+			rangePage.Release()
+			t.Fatalf("boundary %d tail read does not match written data", length)
+		}
+		rangePage.Release()
+	}
+}
+
+func TestOmniStoreCachedStoreConcurrentReadAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+	blob, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Shutdown(blob)
+
+	conf := defaultConf
+	conf.CacheDir = "memory"
+	conf.Compress = "none"
+	conf.BlockSize = 1 << 20
+	conf.Writeback = false
+	conf.PutTimeout = 10 * time.Second
+	conf.GetTimeout = 10 * time.Second
+	store := NewCachedStore(blob, conf, nil)
+
+	id := uint64(time.Now().UnixNano())
+	length := conf.BlockSize
+	payload := make([]byte, length)
+	for i := range payload {
+		payload[i] = byte((i * 61) % 251)
+	}
+	writer := store.NewWriter(id, 0)
+	if n, err := writer.WriteAt(payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("concurrent read write: n=%d err=%v", n, err)
+	}
+	if err := writer.Finish(length); err != nil {
+		t.Fatalf("concurrent read finish: %v", err)
+	}
+	defer func() {
+		if err := store.Remove(id, length); err != nil {
+			t.Errorf("concurrent read remove: %v", err)
+		}
+	}()
+	if err := store.EvictCache(id, uint32(length), nil); err != nil {
+		t.Fatalf("evict before concurrent read: %v", err)
+	}
+
+	const readers = 16
+	const readOffset = 123
+	const readLength = 64 << 10
+	start := make(chan struct{})
+	errCh := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			<-start
+			reader := store.NewReader(id, length)
+			page := NewPage(make([]byte, readLength))
+			defer page.Release()
+			n, err := reader.ReadAt(context.Background(), page, readOffset)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if n != readLength {
+				errCh <- fmt.Errorf("short concurrent read: got %d, want %d", n, readLength)
+				return
+			}
+			if !bytes.Equal(page.Data, payload[readOffset:readOffset+readLength]) {
+				errCh <- errors.New("concurrent read does not match written data")
+				return
+			}
+			errCh <- nil
+		}()
+	}
+	close(start)
+	for i := 0; i < readers; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent read: %v", err)
+		}
+	}
+}
+
+func TestOmniStoreCachedStorePrefetchAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+	blob, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Shutdown(blob)
+
+	conf := defaultConf
+	conf.CacheDir = "memory"
+	conf.Compress = "none"
+	conf.BlockSize = 1 << 20
+	conf.Prefetch = 1
+	conf.Writeback = false
+	conf.PutTimeout = 10 * time.Second
+	conf.GetTimeout = 10 * time.Second
+	store := NewCachedStore(blob, conf, nil)
+
+	id := uint64(time.Now().UnixNano())
+	length := conf.BlockSize
+	payload := make([]byte, length)
+	for i := range payload {
+		payload[i] = byte((i * 47) % 251)
+	}
+	writer := store.NewWriter(id, 0)
+	if n, err := writer.WriteAt(payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("prefetch write: n=%d err=%v", n, err)
+	}
+	if err := writer.Finish(length); err != nil {
+		t.Fatalf("prefetch finish: %v", err)
+	}
+	defer func() {
+		if err := store.Remove(id, length); err != nil {
+			t.Errorf("prefetch remove: %v", err)
+		}
+	}()
+	if err := store.EvictCache(id, uint32(length), nil); err != nil {
+		t.Fatalf("evict before prefetch: %v", err)
+	}
+
+	reader := store.NewReader(id, length)
+	const rangeOffset = 123
+	rangePage := NewPage(make([]byte, 32))
+	if n, err := reader.ReadAt(context.Background(), rangePage, rangeOffset); err != nil || n != len(rangePage.Data) {
+		rangePage.Release()
+		t.Fatalf("prefetch range read: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(rangePage.Data, payload[rangeOffset:rangeOffset+len(rangePage.Data)]) {
+		rangePage.Release()
+		t.Fatal("prefetch range read does not match written data")
+	}
+	rangePage.Release()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		cached := false
+		if err := store.CheckCache(id, uint32(length), nil, func(exists bool, _ string, _ int) {
+			cached = cached || exists
+		}); err != nil {
+			t.Fatalf("check prefetched cache: %v", err)
+		}
+		if cached {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("prefetch did not populate the cache from OmniStore")
+}
+
+func TestOmniStoreCachedStoreWritebackAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+	blob, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Shutdown(blob)
+
+	conf := defaultConf
+	conf.CacheDir = t.TempDir()
+	conf.CacheSize = 64 << 20
+	conf.Compress = "none"
+	conf.BlockSize = 1 << 20
+	conf.Writeback = true
+	conf.WritebackThresholdSize = conf.BlockSize + 1
+	conf.UploadDelay = 0
+	conf.PutTimeout = 10 * time.Second
+	conf.GetTimeout = 10 * time.Second
+	store := NewCachedStore(blob, conf, nil)
+
+	id := uint64(time.Now().UnixNano())
+	length := 64 << 10
+	payload := make([]byte, length)
+	for i := range payload {
+		payload[i] = byte((i * 53) % 251)
+	}
+	writer := store.NewWriter(id, 0)
+	if n, err := writer.WriteAt(payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("writeback write: n=%d err=%v", n, err)
+	}
+	if err := writer.Finish(length); err != nil {
+		t.Fatalf("writeback finish: %v", err)
+	}
+	defer func() {
+		if err := store.Remove(id, length); err != nil {
+			t.Errorf("writeback remove: %v", err)
+		}
+	}()
+
+	rSlice := sliceForRead(id, length, store.(*cachedStore))
+	key := rSlice.key(0)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := blob.Head(context.Background(), key); err == nil {
+			reader := store.NewReader(id, length)
+			if err := store.EvictCache(id, uint32(length), nil); err != nil {
+				t.Fatalf("evict writeback cache: %v", err)
+			}
+			page := NewPage(make([]byte, length))
+			if n, err := reader.ReadAt(context.Background(), page, 0); err != nil || n != length {
+				page.Release()
+				t.Fatalf("read written-back data: n=%d err=%v", n, err)
+			}
+			if !bytes.Equal(page.Data, payload) {
+				page.Release()
+				t.Fatal("written-back data does not match")
+			}
+			page.Release()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("writeback object %q did not reach OmniStore", key)
+}
+
+func TestOmniStoreCachedStoreCompressedAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+	blob, err := object.CreateStorage("omnistore", endpoint, "", "", "")
+	if err != nil {
+		t.Fatalf("create OmniStore backend: %s", err)
+	}
+	defer object.Shutdown(blob)
+
+	conf := defaultConf
+	conf.CacheDir = "memory"
+	conf.Compress = "lz4"
+	conf.BlockSize = 1 << 20
+	conf.Writeback = false
+	conf.PutTimeout = 10 * time.Second
+	conf.GetTimeout = 10 * time.Second
+	store := NewCachedStore(blob, conf, nil)
+
+	id := uint64(time.Now().UnixNano())
+	length := conf.BlockSize + 123
+	payload := make([]byte, length)
+	for i := range payload {
+		payload[i] = byte((i / 4096) % 7)
+	}
+	writer := store.NewWriter(id, 0)
+	if n, err := writer.WriteAt(payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("compressed chunk write: n=%d err=%v", n, err)
+	}
+	if err := writer.Finish(length); err != nil {
+		t.Fatalf("compressed chunk finish: %v", err)
+	}
+	defer func() {
+		if err := store.Remove(id, length); err != nil {
+			t.Errorf("compressed chunk remove: %v", err)
+		}
+	}()
+
+	reader := store.NewReader(id, length)
+	page := NewPage(make([]byte, length))
+	defer page.Release()
+	if n, err := reader.ReadAt(context.Background(), page, 0); err != nil || n != length {
+		t.Fatalf("compressed chunk read: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(page.Data, payload) {
+		t.Fatal("compressed chunk read does not match written data")
+	}
+}
+
 func TestStoreMemCache(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf

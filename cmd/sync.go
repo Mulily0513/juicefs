@@ -410,7 +410,16 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 	name := strings.ToLower(u.Scheme)
 
 	var endpoint string
-	if name == "file" {
+	if name == "omnistore" {
+		// Keep OmniStore's pool and Monitor query parameters in the endpoint,
+		// but leave the URI path to the common WithPrefix handling below. If
+		// the path were passed to both layers, direct sync would address
+		// prefix/prefix/object instead of prefix/object.
+		withoutPath := *u
+		withoutPath.Path = ""
+		withoutPath.RawPath = ""
+		endpoint = withoutPath.String()
+	} else if name == "file" {
 		endpoint = u.Path
 	} else if name == "hdfs" {
 		endpoint = u.Host

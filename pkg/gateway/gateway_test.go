@@ -17,8 +17,11 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -111,6 +114,13 @@ func newTestGateway(t *testing.T, conf Config) (*jfsObjects, *fs.FileSystem, str
 		Capacity:  1 << 30,
 		DirStats:  true,
 	}
+	storageName, storageEndpoint := "mem", ""
+	if os.Getenv("OMNISTORE_JUICEFS_GATEWAY_TEST") == "1" {
+		storageName = "omnistore"
+		storageEndpoint = os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+		format.Storage = storageName
+		format.Compression = "none"
+	}
 	if err := m.Init(format, true); err != nil {
 		t.Fatalf("init meta: %s", err)
 	}
@@ -126,12 +136,24 @@ func newTestGateway(t *testing.T, conf Config) (*jfsObjects, *fs.FileSystem, str
 		EntryTimeout:    time.Millisecond * 100,
 		AttrTimeout:     time.Millisecond * 100,
 	}
-	objStore, _ := object.CreateStorage("mem", "", "", "", "")
+	rawObjStore, err := object.CreateStorage(storageName, storageEndpoint, "", "", "")
+	if err != nil {
+		t.Fatalf("create object storage: %s", err)
+	}
+	objStore := rawObjStore
+	if storageName == "omnistore" {
+		objStore = object.WithPrefix(rawObjStore, fmt.Sprintf("juicefs-live-gateway-%d/", time.Now().UnixNano()))
+	}
 	store := chunk.NewCachedStore(objStore, *vfsConf.Chunk, nil)
 	jfs, err := fs.NewFileSystem(&vfsConf, m, store, nil)
 	if err != nil {
+		object.Shutdown(rawObjStore)
 		t.Fatalf("initialize failed: %s", err)
 	}
+	t.Cleanup(func() {
+		_ = jfs.Close()
+		object.Shutdown(rawObjStore)
+	})
 	conf.Bucket = format.Name
 	if conf.Umask == 0 {
 		conf.Umask = 022
@@ -145,6 +167,51 @@ func newTestGateway(t *testing.T, conf Config) (*jfsObjects, *fs.FileSystem, str
 	}
 	mctx = meta.NewContext(uint32(os.Getpid()), uint32(os.Getuid()), []uint32{uint32(os.Getgid())})
 	return jfsObj, jfs, format.Name
+}
+
+func TestOmniStoreGatewayDataAgainstCluster(t *testing.T) {
+	endpoint := os.Getenv("OMNISTORE_JUICEFS_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set OMNISTORE_JUICEFS_ENDPOINT to run against a live OmniStore cluster")
+	}
+	t.Setenv("OMNISTORE_JUICEFS_GATEWAY_TEST", "1")
+
+	jfsObj, jfs, bucket := newTestGateway(t, Config{})
+	f, eno := jfs.Create(mctx, jfsObj.path(bucket, "gateway-object"), 0666, 022)
+	if eno != 0 {
+		t.Fatalf("create object: %s", eno)
+	}
+	payload := make([]byte, 1<<20+97)
+	for i := range payload {
+		payload[i] = byte((i * 37) % 251)
+	}
+	if n, eno := f.Write(mctx, payload); eno != 0 || n != len(payload) {
+		t.Fatalf("write object: n=%d err=%s", n, eno)
+	}
+	if eno := f.Fsync(mctx); eno != 0 {
+		t.Fatalf("fsync object: %s", eno)
+	}
+	if eno := f.Close(mctx); eno != 0 {
+		t.Fatalf("close object: %s", eno)
+	}
+
+	info, err := jfsObj.GetObjectInfo(context.Background(), bucket, "gateway-object", minio.ObjectOptions{})
+	if err != nil || info.Size != int64(len(payload)) {
+		t.Fatalf("gateway head: size=%d err=%v", info.Size, err)
+	}
+	rangeSpec := &minio.HTTPRangeSpec{Start: 1<<20 - 11, End: 1<<20 + 20}
+	reader, err := jfsObj.GetObjectNInfo(context.Background(), bucket, "gateway-object", rangeSpec, nil, 0, minio.ObjectOptions{})
+	if err != nil {
+		t.Fatalf("gateway range get: %s", err)
+	}
+	got, err := io.ReadAll(reader)
+	reader.Close()
+	if err != nil {
+		t.Fatalf("gateway range read: %s", err)
+	}
+	if !bytes.Equal(got, payload[1<<20-11:1<<20+21]) {
+		t.Fatalf("gateway range data mismatch: got %d bytes", len(got))
+	}
 }
 
 func TestMkdirAllInBucket(t *testing.T) {
