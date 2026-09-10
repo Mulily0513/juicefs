@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -52,14 +53,22 @@ func integrationStorageFlags(fallback string) []string {
 	return []string{"--bucket", fallback}
 }
 
+func integrationMetadataURL(db int, fallback string) string {
+	if base := os.Getenv("OMNISTORE_JUICEFS_CMD_METADATA"); base != "" {
+		return strings.TrimRight(base, "/") + "/" + fmt.Sprint(db)
+	}
+	return fallback
+}
+
 func startGateway(t *testing.T) {
-	opt, _ := redis.ParseURL(gatewayMeta)
+	metadata := integrationMetadataURL(14, gatewayMeta)
+	opt, _ := redis.ParseURL(metadata)
 	rdb := redis.NewClient(opt)
 	_ = rdb.FlushDB(context.Background())
 	testDir := t.TempDir()
 	formatArgs := []string{"", "format"}
 	formatArgs = append(formatArgs, integrationStorageFlags(testDir)...)
-	formatArgs = append(formatArgs, gatewayMeta, gatewayVolume)
+	formatArgs = append(formatArgs, metadata, gatewayVolume)
 	if err := Main(formatArgs); err != nil {
 		t.Fatalf("format failed: %s", err)
 	}
@@ -68,7 +77,7 @@ func startGateway(t *testing.T) {
 	ResetHttp()
 
 	go func() {
-		if err := Main([]string{"", "gateway", gatewayMeta, gatewayAddr, "--multi-buckets", "--keep-etag", "--object-tag", "--no-usage-report"}); err != nil {
+		if err := Main([]string{"", "gateway", metadata, gatewayAddr, "--multi-buckets", "--keep-etag", "--object-tag", "--no-usage-report"}); err != nil {
 			t.Errorf("gateway failed: %s", err)
 		}
 	}()
@@ -76,13 +85,14 @@ func startGateway(t *testing.T) {
 }
 
 func startWebdav(t *testing.T) {
-	opt, _ := redis.ParseURL(webdavMeta)
+	metadata := integrationMetadataURL(15, webdavMeta)
+	opt, _ := redis.ParseURL(metadata)
 	rdb := redis.NewClient(opt)
 	_ = rdb.FlushDB(context.Background())
 	testDir := t.TempDir()
 	formatArgs := []string{"", "format"}
 	formatArgs = append(formatArgs, integrationStorageFlags(testDir)...)
-	formatArgs = append(formatArgs, webdavMeta, webdavVolume)
+	formatArgs = append(formatArgs, metadata, webdavVolume)
 	if err := Main(formatArgs); err != nil {
 		t.Fatalf("format failed: %s", err)
 	}
@@ -93,7 +103,7 @@ func startWebdav(t *testing.T) {
 	go func() {
 		os.Setenv("WEBDAV_USER", "root")
 		os.Setenv("WEBDAV_PASSWORD", "1234")
-		if err := Main([]string{"", "webdav", webdavMeta, webdavAddr, "--no-usage-report"}); err != nil {
+		if err := Main([]string{"", "webdav", metadata, webdavAddr, "--no-usage-report"}); err != nil {
 			t.Errorf("gateway failed: %s", err)
 		}
 	}()

@@ -51,6 +51,10 @@ var testMountPoint = filepath.Join(os.TempDir(), fmt.Sprintf("jfs-unit-test-%d",
 
 const testVolume = "test"
 
+func currentTestMeta() string {
+	return integrationMetadataURL(11, testMeta)
+}
+
 // gomonkey may encounter the problem of insufficient permissions under mac, please solve it by viewing this link https://github.com/agiledragon/gomonkey/issues/70
 func Test_exposeMetrics(t *testing.T) {
 	if runtime.GOOS != "linux" {
@@ -121,7 +125,7 @@ func ResetHttp() {
 }
 
 func resetTestMeta() *redis.Client { // using Redis
-	opt, _ := redis.ParseURL(testMeta)
+	opt, _ := redis.ParseURL(currentTestMeta())
 	rdb := redis.NewClient(opt)
 	_ = rdb.FlushDB(context.Background())
 	return rdb
@@ -142,7 +146,7 @@ func mountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraMoun
 	}
 	formatArgs := []string{"", "format"}
 	formatArgs = append(formatArgs, integrationStorageFlags(testDir)...)
-	formatArgs = append(formatArgs, testMeta, testVolume)
+	formatArgs = append(formatArgs, currentTestMeta(), testVolume)
 	if extraFormatOpts != nil {
 		formatArgs = append(formatArgs, extraFormatOpts...)
 	}
@@ -154,7 +158,7 @@ func mountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraMoun
 	ResetHttp()
 
 	os.Setenv("JFS_SUPERVISOR", "test")
-	mountArgs := []string{"", "mount", "--enable-xattr", testMeta, testMountPoint, "--attr-cache", "0", "--entry-cache", "0", "--dir-entry-cache", "0", "--no-usage-report"}
+	mountArgs := []string{"", "mount", "--enable-xattr", currentTestMeta(), testMountPoint, "--attr-cache", "0", "--entry-cache", "0", "--dir-entry-cache", "0", "--no-usage-report"}
 	if extraMountOpts != nil {
 		mountArgs = append(mountArgs, extraMountOpts...)
 	}
@@ -285,7 +289,7 @@ func tryMountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraM
 	}
 	formatArgs := []string{"", "format"}
 	formatArgs = append(formatArgs, integrationStorageFlags(testDir)...)
-	formatArgs = append(formatArgs, testMeta, testVolume)
+	formatArgs = append(formatArgs, currentTestMeta(), testVolume)
 	if extraFormatOpts != nil {
 		formatArgs = append(formatArgs, extraFormatOpts...)
 	}
@@ -296,7 +300,7 @@ func tryMountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraM
 	// must do reset, otherwise will panic
 	ResetHttp()
 
-	mountArgs := []string{"", "mount", "--enable-xattr", testMeta, testMountPoint, "--attr-cache", "0", "--entry-cache", "0", "--dir-entry-cache", "0", "--no-usage-report"}
+	mountArgs := []string{"", "mount", "--enable-xattr", currentTestMeta(), testMountPoint, "--attr-cache", "0", "--entry-cache", "0", "--dir-entry-cache", "0", "--no-usage-report"}
 	if extraMountOpts != nil {
 		mountArgs = append(mountArgs, extraMountOpts...)
 	}

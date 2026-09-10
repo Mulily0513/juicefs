@@ -311,6 +311,15 @@ func (s *omnistoreStorage) mtimeRef(key string) omnistore.ChunkRef {
 	return s.ref(key + mtimeObjectSuffix)
 }
 
+// JuiceFS chunk keys are internal block objects. Their size and lifetime are
+// carried by the chunk metadata, so persisting a separate mtime Chunk for
+// every block only adds another replicated write without changing JuiceFS'
+// observable semantics. Keep the richer mtime representation for ordinary
+// ObjectStorage users, where Head/List may expose it to callers.
+func isJuiceFSChunkKey(key string) bool {
+	return strings.HasPrefix(key, "chunks/") || strings.Contains(key, "/chunks/")
+}
+
 func (s *omnistoreStorage) partRef(key string, generation, part uint64) omnistore.ChunkRef {
 	return s.ref(key + partObjectSuffix + strconv.FormatUint(generation, 36) + "/" + strconv.FormatUint(part, 36))
 }
@@ -443,7 +452,7 @@ func (s *omnistoreStorage) putReaderLocked(ctx context.Context, key string, in i
 	} else {
 		err = s.putSingle(ctx, key, data, getters...)
 	}
-	if err == nil {
+	if err == nil && !isJuiceFSChunkKey(key) {
 		if mtimeErr := s.rememberMtime(ctx, key); mtimeErr != nil {
 			return mtimeErr
 		}
@@ -898,6 +907,16 @@ func (s *omnistoreStorage) Delete(ctx context.Context, key string, _ ...AttrGett
 }
 
 func (s *omnistoreStorage) deleteRef(ctx context.Context, ref omnistore.ChunkRef) error {
+	// Delete is a Raft-backed operation in OmniStore. Avoid submitting a
+	// no-op delete for the reserved representations that are absent on the
+	// normal single-Chunk path; unlike an S3 delete, an absent OmniStore Chunk
+	// would otherwise still consume a PG log entry and wait for replication.
+	if _, err := s.client.Stat(ctx, ref); err != nil {
+		if errors.Is(err, omnistore.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
 	err := s.client.Delete(ctx, ref)
 	if errors.Is(err, omnistore.ErrNotFound) {
 		return nil
@@ -1256,6 +1275,11 @@ func newOmniStore(endpoint, _accessKey, _secretKey, _token string) (ObjectStorag
 	client, err := omnistore.New(omnistore.Config{
 		Monitors: parsed.monitors,
 		PoolID:   parsed.poolID,
+		// The Docker AIO backend can take longer than the SDK's generic
+		// 10-second default to commit a PG entry. Keep one request alive long
+		// enough to receive its result instead of retrying the same mutation
+		// while the first Raft entry is still being applied.
+		RequestTimeout: 60 * time.Second,
 		// Monitor/OSD placement can briefly race with a PG leader change.
 		// Retry transient leader and PG state errors at the SDK boundary so
 		// JuiceFS does not turn a normal election window into an I/O error.
