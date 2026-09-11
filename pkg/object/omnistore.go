@@ -46,10 +46,6 @@ type omniChunkClient interface {
 	Close() error
 }
 
-type omniChunkLister interface {
-	List(ctx context.Context, poolID uint64, prefix, marker string, limit uint32) ([]omnistore.ChunkEntry, bool, string, error)
-}
-
 // omnistoreStorage adapts JuiceFS object-block operations to OmniStore's
 // fixed-size Chunk API. The normal JuiceFS Chunk path already splits files
 // into objects, so those objects use one OmniStore Chunk. Direct users of the
@@ -863,36 +859,34 @@ func (s *omnistoreStorage) Delete(ctx context.Context, key string, _ ...AttrGett
 	// A failed or superseded fragmented PUT can leave retired generations
 	// behind. Delete is the safe point at which those hidden parts can be
 	// removed as well; List never exposes them as logical objects.
-	if lister, ok := s.client.(omniChunkLister); ok {
-		partPrefix := s.prefix + key + partObjectSuffix
-		marker := ""
-		for {
-			entries, hasMore, next, listErr := lister.List(ctx, s.poolID, partPrefix, marker, 256)
-			if listErr != nil {
-				if firstErr == nil {
-					firstErr = listErr
-				}
-				break
+	partPrefix := s.prefix + key + partObjectSuffix
+	marker := ""
+	for {
+		entries, hasMore, next, listErr := s.client.ListChunks(ctx, s.poolID, partPrefix, marker, 256)
+		if listErr != nil {
+			if firstErr == nil {
+				firstErr = listErr
 			}
-			for _, entry := range entries {
-				if !strings.HasPrefix(entry.ChunkID, partPrefix) {
-					continue
-				}
-				if deleteErr := s.deleteRef(ctx, omnistore.ChunkRef{PoolID: s.poolID, ChunkID: entry.ChunkID}); deleteErr != nil && firstErr == nil {
-					firstErr = deleteErr
-				}
-			}
-			if !hasMore {
-				break
-			}
-			if next == "" || next == marker {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("omnistore delete %q: part list marker did not advance", key)
-				}
-				break
-			}
-			marker = next
+			break
 		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.ChunkID, partPrefix) {
+				continue
+			}
+			if deleteErr := s.deleteRef(ctx, omnistore.ChunkRef{PoolID: s.poolID, ChunkID: entry.ChunkID}); deleteErr != nil && firstErr == nil {
+				firstErr = deleteErr
+			}
+		}
+		if !hasMore {
+			break
+		}
+		if next == "" || next == marker {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("omnistore delete %q: part list marker did not advance", key)
+			}
+			break
+		}
+		marker = next
 	}
 	for uploadID, upload := range s.uploads {
 		if upload.key == key {
@@ -1020,10 +1014,6 @@ func (s *omnistoreStorage) List(ctx context.Context, prefix, startAfter, token, 
 	if limit <= 0 || limit > int64(^uint32(0)) {
 		return nil, false, "", fmt.Errorf("omnistore list: invalid limit %d", limit)
 	}
-	lister, ok := s.client.(omniChunkLister)
-	if !ok {
-		return nil, false, "", notSupported
-	}
 	cursor := token
 	if cursor == "" {
 		cursor = s.prefix + startAfter
@@ -1042,7 +1032,7 @@ func (s *omnistoreStorage) List(ctx context.Context, prefix, startAfter, token, 
 		seen := make(map[string]int)
 		lastVisibleMarker := ""
 		for {
-			entries, hasMore, next, err := lister.List(ctx, s.poolID, physicalPrefix, cursor, uint32(limit))
+			entries, hasMore, next, err := s.client.ListChunks(ctx, s.poolID, physicalPrefix, cursor, uint32(limit))
 			if err != nil {
 				return nil, false, "", mapOmniError(err)
 			}
@@ -1120,7 +1110,7 @@ func (s *omnistoreStorage) List(ctx context.Context, prefix, startAfter, token, 
 	}
 	for {
 		entryCursor := cursor
-		entries, hasMore, next, err := lister.List(ctx, s.poolID, physicalPrefix, cursor, 1)
+		entries, hasMore, next, err := s.client.ListChunks(ctx, s.poolID, physicalPrefix, cursor, 1)
 		if err != nil {
 			return nil, false, "", mapOmniError(err)
 		}

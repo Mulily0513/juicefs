@@ -92,7 +92,7 @@ func (f *fakeOmniStore) Delete(_ context.Context, ref omnistore.ChunkRef) error 
 	return nil
 }
 
-func (f *fakeOmniStore) List(_ context.Context, poolID uint64, prefix, marker string, limit uint32) ([]omnistore.ChunkEntry, bool, string, error) {
+func (f *fakeOmniStore) ListChunks(_ context.Context, poolID uint64, prefix, marker string, limit uint32) ([]omnistore.ChunkEntry, bool, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
