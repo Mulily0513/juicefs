@@ -110,7 +110,7 @@ require (
 	xorm.io/xorm v1.0.7
 )
 
-replace omnistorage/sdk/go => ../omnistore/sdk/go
+replace omnistorage/sdk/go => ../OmniChunkStore/sdk/go
 
 require (
 	cel.dev/expr v0.25.1 // indirect
