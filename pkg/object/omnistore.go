@@ -35,7 +35,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	omnistore "omnistorage/libomnistore/go"
+	omnistore "omnistorage/sdk/go"
 )
 
 // omniChunkClient is kept deliberately smaller than omnistore.Client so the
@@ -63,7 +63,7 @@ type omnistoreStorage struct {
 	poolID   uint64
 	prefix   string
 	endpoint string
-	mu       sync.Mutex
+	stateMu  sync.RWMutex
 	uploads  map[string]*omniMultipartUpload
 	// The current OmniStore Chunk metadata contains size but not mtime. Keep
 	// the timestamp assigned by this adapter so List and Head expose a stable,
@@ -89,6 +89,7 @@ const (
 )
 
 type omniMultipartUpload struct {
+	mu      sync.Mutex
 	key     string
 	created time.Time
 	parts   map[int]omniMultipartPart
@@ -258,6 +259,8 @@ func (s *omnistoreStorage) rememberMtime(ctx context.Context, key string) error 
 	if n != len(data) {
 		return fmt.Errorf("omnistore put %q: short mtime write: got %d, want %d", key, n, len(data))
 	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	if s.mtimes == nil {
 		s.mtimes = make(map[string]time.Time)
 	}
@@ -266,12 +269,12 @@ func (s *omnistoreStorage) rememberMtime(ctx context.Context, key string) error 
 }
 
 func (s *omnistoreStorage) mtimeFor(ctx context.Context, key string) (time.Time, error) {
+	s.stateMu.RLock()
 	if mtime, ok := s.mtimes[key]; ok {
+		s.stateMu.RUnlock()
 		return mtime, nil
 	}
-	if s.mtimes == nil {
-		s.mtimes = make(map[string]time.Time)
-	}
+	s.stateMu.RUnlock()
 	if info, err := s.client.Stat(ctx, s.mtimeRef(key)); err == nil {
 		if info.Size != 8 {
 			return time.Time{}, fmt.Errorf("omnistore mtime %q: invalid size %d", key, info.Size)
@@ -285,13 +288,23 @@ func (s *omnistoreStorage) mtimeFor(ctx context.Context, key string) (time.Time,
 			return time.Time{}, fmt.Errorf("omnistore mtime %q: short read: got %d, want %d", key, n, len(data))
 		}
 		mtime := time.Unix(0, int64(binary.BigEndian.Uint64(data)))
+		s.stateMu.Lock()
+		if s.mtimes == nil {
+			s.mtimes = make(map[string]time.Time)
+		}
 		s.mtimes[key] = mtime
+		s.stateMu.Unlock()
 		return mtime, nil
 	} else if !errors.Is(err, omnistore.ErrNotFound) {
 		return time.Time{}, mapOmniError(err)
 	}
 	mtime := time.Now()
+	s.stateMu.Lock()
+	if s.mtimes == nil {
+		s.mtimes = make(map[string]time.Time)
+	}
 	s.mtimes[key] = mtime
+	s.stateMu.Unlock()
 	return mtime, nil
 }
 
@@ -368,8 +381,6 @@ func (s *omnistoreStorage) logicalKey(key string) (string, bool) {
 }
 
 func (s *omnistoreStorage) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.getLocked(ctx, key, off, limit, getters...)
 }
 
@@ -426,8 +437,6 @@ func (s *omnistoreStorage) getLocked(ctx context.Context, key string, off, limit
 }
 
 func (s *omnistoreStorage) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.putReaderLocked(ctx, key, in, getters...)
 }
 
@@ -457,9 +466,6 @@ func (s *omnistoreStorage) putReaderLocked(ctx context.Context, key string, in i
 }
 
 func (s *omnistoreStorage) Copy(ctx context.Context, dst, src string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	r, err := s.getLocked(ctx, src, 0, -1)
 	if err != nil {
 		return err
@@ -473,8 +479,8 @@ func (s *omnistoreStorage) Copy(ctx context.Context, dst, src string) error {
 }
 
 func (s *omnistoreStorage) CreateMultipartUpload(_ context.Context, key string) (*MultipartUpload, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	if s.uploads == nil {
 		s.uploads = make(map[string]*omniMultipartUpload)
 	}
@@ -501,13 +507,14 @@ func (s *omnistoreStorage) uploadPartLocked(ctx context.Context, key, uploadID s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s.uploads == nil {
-		return nil, fmt.Errorf("omnistore upload %q: %w", uploadID, os.ErrNotExist)
-	}
+	s.stateMu.RLock()
 	upload, ok := s.uploads[uploadID]
+	s.stateMu.RUnlock()
 	if !ok || upload.key != key {
 		return nil, fmt.Errorf("omnistore upload %q: %w", uploadID, os.ErrNotExist)
 	}
+	upload.mu.Lock()
+	defer upload.mu.Unlock()
 	checksum := sha256.Sum256(body)
 	etag := hex.EncodeToString(checksum[:])
 	ref := s.multipartPartRef(key, uploadID, num, etag)
@@ -530,14 +537,10 @@ func (s *omnistoreStorage) uploadPartLocked(ctx context.Context, key, uploadID s
 }
 
 func (s *omnistoreStorage) UploadPart(ctx context.Context, key, uploadID string, num int, body []byte) (*Part, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.uploadPartLocked(ctx, key, uploadID, num, body)
 }
 
 func (s *omnistoreStorage) UploadPartCopy(ctx context.Context, key, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if off < 0 || size <= 0 || size > int64(omnistore.MaxChunkSize) {
 		return nil, fmt.Errorf("omnistore upload part copy: invalid range off=%d size=%d", off, size)
 	}
@@ -557,15 +560,14 @@ func (s *omnistoreStorage) UploadPartCopy(ctx context.Context, key, uploadID str
 }
 
 func (s *omnistoreStorage) CompleteUpload(ctx context.Context, key, uploadID string, parts []*Part) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.uploads == nil {
-		return fmt.Errorf("omnistore upload %q: %w", uploadID, os.ErrNotExist)
-	}
+	s.stateMu.RLock()
 	upload, ok := s.uploads[uploadID]
+	s.stateMu.RUnlock()
 	if !ok || upload.key != key {
 		return fmt.Errorf("omnistore upload %q: %w", uploadID, os.ErrNotExist)
 	}
+	upload.mu.Lock()
+	defer upload.mu.Unlock()
 	ordered := make([]omniMultipartPart, 0, len(parts))
 	lastNum := 0
 	for _, requested := range parts {
@@ -589,27 +591,33 @@ func (s *omnistoreStorage) CompleteUpload(ctx context.Context, key, uploadID str
 			return mapOmniError(err)
 		}
 	}
+	s.stateMu.Lock()
 	delete(s.uploads, uploadID)
+	s.stateMu.Unlock()
 	return nil
 }
 
 func (s *omnistoreStorage) AbortUpload(ctx context.Context, key, uploadID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.stateMu.RLock()
 	upload, ok := s.uploads[uploadID]
+	s.stateMu.RUnlock()
 	if !ok || upload.key != key {
 		return
 	}
+	upload.mu.Lock()
+	defer upload.mu.Unlock()
 	for _, part := range upload.parts {
 		_ = s.deleteRef(ctx, part.ref)
 	}
+	s.stateMu.Lock()
 	delete(s.uploads, uploadID)
+	s.stateMu.Unlock()
 }
 
 func (s *omnistoreStorage) ListUploads(_ context.Context, marker string) ([]*PendingPart, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.stateMu.RLock()
 	if len(s.uploads) == 0 {
+		s.stateMu.RUnlock()
 		return nil, "", nil
 	}
 	ids := make([]string, 0, len(s.uploads))
@@ -618,11 +626,19 @@ func (s *omnistoreStorage) ListUploads(_ context.Context, marker string) ([]*Pen
 			ids = append(ids, id)
 		}
 	}
+	s.stateMu.RUnlock()
 	sort.Strings(ids)
 	result := make([]*PendingPart, 0, len(ids))
 	for _, id := range ids {
+		s.stateMu.RLock()
 		upload := s.uploads[id]
+		s.stateMu.RUnlock()
+		if upload == nil {
+			continue
+		}
+		upload.mu.Lock()
 		result = append(result, &PendingPart{Key: upload.key, UploadID: id, Created: upload.created})
+		upload.mu.Unlock()
 	}
 	return result, "", nil
 }
@@ -836,8 +852,6 @@ func (s *omnistoreStorage) getFragmented(ctx context.Context, key string, manife
 }
 
 func (s *omnistoreStorage) Delete(ctx context.Context, key string, _ ...AttrGetter) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	manifest, err := s.loadManifest(ctx, key)
 	if err != nil {
 		return mapOmniError(err)
@@ -888,6 +902,7 @@ func (s *omnistoreStorage) Delete(ctx context.Context, key string, _ ...AttrGett
 		}
 		marker = next
 	}
+	s.stateMu.Lock()
 	for uploadID, upload := range s.uploads {
 		if upload.key == key {
 			delete(s.uploads, uploadID)
@@ -897,6 +912,7 @@ func (s *omnistoreStorage) Delete(ctx context.Context, key string, _ ...AttrGett
 	if result == nil {
 		delete(s.mtimes, key)
 	}
+	s.stateMu.Unlock()
 	return result
 }
 
@@ -919,8 +935,6 @@ func (s *omnistoreStorage) deleteRef(ctx context.Context, ref omnistore.ChunkRef
 }
 
 func (s *omnistoreStorage) Head(ctx context.Context, key string) (Object, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	manifest, err := s.loadManifest(ctx, key)
 	if err != nil {
 		return nil, mapOmniError(err)
@@ -1009,8 +1023,6 @@ func (s *omnistoreStorage) visibleEntry(ctx context.Context, entry omnistore.Chu
 
 func (s *omnistoreStorage) List(ctx context.Context, prefix, startAfter, token, delimiter string,
 	limit int64, _ bool) ([]Object, bool, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if limit <= 0 || limit > int64(^uint32(0)) {
 		return nil, false, "", fmt.Errorf("omnistore list: invalid limit %d", limit)
 	}

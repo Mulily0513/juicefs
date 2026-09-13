@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	omnistore "omnistorage/libomnistore/go"
+	omnistore "omnistorage/sdk/go"
 )
 
 type fakeOmniStore struct {

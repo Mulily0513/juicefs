@@ -3,7 +3,7 @@ module github.com/juicedata/juicefs
 go 1.25.10
 
 require (
-	omnistorage/libomnistore/go v0.0.0
+	omnistorage/sdk/go v0.0.0
 	cloud.google.com/go/compute/metadata v0.9.0
 	cloud.google.com/go/storage v1.48.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.20.0
@@ -110,7 +110,7 @@ require (
 	xorm.io/xorm v1.0.7
 )
 
-replace omnistorage/libomnistore/go => ../omnistore/libomnistore/go
+replace omnistorage/sdk/go => ../omnistore/sdk/go
 
 require (
 	cel.dev/expr v0.25.1 // indirect
